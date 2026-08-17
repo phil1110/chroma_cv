@@ -1,0 +1,2 @@
+import{describe,expect,it}from'vitest';import{cvSchema,defaultCv,defaultTheme,themeSchema}from'../src/model.js';
+describe('CV validation',()=>{it('accepts seeded content',()=>expect(cvSchema.safeParse(defaultCv).success).toBe(true));it('rejects unsafe section identifiers',()=>{const cv=structuredClone(defaultCv);cv.sections[0].id='../uploads';expect(cvSchema.safeParse(cv).success).toBe(false)});it('rejects non-token theme colors',()=>expect(themeSchema.safeParse({...defaultTheme,accent:'red'}).success).toBe(false))});

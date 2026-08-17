@@ -1,0 +1,66 @@
+import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
+import cors from '@fastify/cors';
+import cookie from '@fastify/cookie';
+import helmet from '@fastify/helmet';
+import multipart from '@fastify/multipart';
+import rateLimit from '@fastify/rate-limit';
+import bcrypt from 'bcryptjs';
+import { SignJWT, jwtVerify } from 'jose';
+import pg from 'pg';
+import sharp from 'sharp';
+import { createReadStream } from 'node:fs';
+import { mkdir, rename, unlink } from 'node:fs/promises';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { z } from 'zod';
+import { cvSchema, defaultCv, defaultTheme, sectionSchema, themeSchema, type CvDocument, type Theme } from './model.js';
+import { themeFromImage } from './theme.js';
+import { renderPdf } from './pdf.js';
+
+const env = {
+ port:Number(process.env.PORT||3000), database:process.env.DATABASE_URL||'postgres://cv_user:change-me-in-production@localhost:5432/digital_cv',
+ jwt:process.env.JWT_SECRET||'local-development-secret-change-me-now', email:(process.env.ADMIN_EMAIL||'admin@example.com').toLowerCase(), password:process.env.ADMIN_PASSWORD||'ChangeMe123!',
+ publicOrigin:process.env.PUBLIC_ORIGIN||'http://localhost:8080', adminOrigin:process.env.ADMIN_ORIGIN||'http://localhost:8081', maxMb:Number(process.env.UPLOAD_MAX_MB||8)
+};
+if(env.jwt.length<32) throw new Error('JWT_SECRET must contain at least 32 characters');
+const secret=new TextEncoder().encode(env.jwt); const pool=new pg.Pool({connectionString:env.database}); const uploadDir='/app/uploads';
+type StateRow={draft:CvDocument;published:CvDocument;draft_theme:Theme;published_theme:Theme;draft_profile_image_path:string|null;published_profile_image_path:string|null;draft_profile_image_version:number;published_profile_image_version:number;published_at:string;updated_at:string};
+const app=Fastify({logger:true,bodyLimit:env.maxMb*1024*1024+1024*100,trustProxy:true});
+await app.register(helmet,{contentSecurityPolicy:false});
+await app.register(cors,{origin:[env.publicOrigin,env.adminOrigin],credentials:true,methods:['GET','POST','PUT','PATCH','DELETE']});
+await app.register(cookie); await app.register(multipart,{limits:{fileSize:env.maxMb*1024*1024,files:1,fields:10}}); await app.register(rateLimit,{max:180,timeWindow:'1 minute'});
+
+async function bootstrap(){await mkdir(uploadDir,{recursive:true}); const hash=await bcrypt.hash(env.password,12); await pool.query('INSERT INTO administrators(email,password_hash) VALUES($1,$2) ON CONFLICT(email) DO NOTHING',[env.email,hash]); await pool.query(`INSERT INTO cv_state(id,draft,published,draft_theme,published_theme) VALUES(1,$1,$1,$2,$2) ON CONFLICT(id) DO NOTHING`,[defaultCv,defaultTheme]);}
+async function state():Promise<StateRow>{const result=await pool.query('SELECT * FROM cv_state WHERE id=1');return result.rows[0] as StateRow;}
+async function tokenFor(id:string,email:string){return new SignJWT({email}).setProtectedHeader({alg:'HS256'}).setSubject(id).setIssuedAt().setExpirationTime('8h').sign(secret)}
+async function requireAdmin(req:FastifyRequest,reply:FastifyReply){try{const token=req.cookies.cv_admin;if(!token)throw Error();const {payload}=await jwtVerify(token,secret);(req as FastifyRequest&{adminId:string}).adminId=payload.sub!;}catch{return reply.code(401).send({error:'Authentication required'});}}
+async function audit(req:FastifyRequest,action:string,details:object={}){const id=(req as FastifyRequest&{adminId?:string}).adminId||null;await pool.query('INSERT INTO audit_log(administrator_id,action,details) VALUES($1,$2,$3)',[id,action,details]);}
+const slug=(s:string)=>s.toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+
+app.get('/health',async()=>{await pool.query('SELECT 1');return{status:'ok'}});
+app.get('/api/public/cv',async(_req,reply)=>{const s=await state();reply.header('Cache-Control','no-cache, must-revalidate');return{cv:{...s.published,profileImageUrl:s.published_profile_image_path?`/api/public/profile-image?v=${s.published_profile_image_version}`:undefined,updatedAt:s.published_at},theme:s.published_theme};});
+app.get('/api/public/profile-image',async(_req,reply)=>{const s=await state();if(!s.published_profile_image_path)return reply.code(404).send({error:'No profile image'});return reply.type('image/webp').header('Cross-Origin-Resource-Policy','cross-origin').header('Cache-Control','public,max-age=31536000,immutable').send(createReadStream(join(uploadDir,s.published_profile_image_path)));});
+app.get('/api/public/pdf',{config:{rateLimit:{max:8,timeWindow:'1 minute'}}},async(_req,reply)=>{const s=await state();const bytes=await renderPdf(s.published,s.published_theme,env.publicOrigin);const filename=`${slug(s.published.name)||'digital'}-cv.pdf`;return reply.header('Content-Type','application/pdf').header('Content-Disposition',`attachment; filename="${filename}"`).header('Cache-Control','no-store').send(bytes);});
+
+app.post('/api/auth/login',{config:{rateLimit:{max:8,timeWindow:'15 minutes'}}},async(req,reply)=>{const input=z.object({email:z.string().email(),password:z.string().min(8).max(200)}).safeParse(req.body);if(!input.success)return reply.code(400).send({error:'Enter a valid email and password'});const result=await pool.query('SELECT id,email,password_hash FROM administrators WHERE email=$1',[input.data.email.toLowerCase()]);const admin=result.rows[0];if(!admin||!await bcrypt.compare(input.data.password,admin.password_hash))return reply.code(401).send({error:'Email or password is incorrect'});reply.setCookie('cv_admin',await tokenFor(admin.id,admin.email),{httpOnly:true,sameSite:'lax',secure:process.env.NODE_ENV==='production'&&env.adminOrigin.startsWith('https'),path:'/',maxAge:28800});return{admin:{email:admin.email}};});
+app.post('/api/auth/logout',async(_req,reply)=>{reply.clearCookie('cv_admin',{path:'/'});return{ok:true}});
+app.get('/api/auth/me',{preHandler:requireAdmin},async(req)=>({authenticated:true,email:(await jwtVerify(req.cookies.cv_admin!,secret)).payload.email}));
+
+app.get('/api/admin/state',{preHandler:requireAdmin},async()=>{const s=await state();return{cv:{...s.draft,profileImageUrl:s.draft_profile_image_path?`/api/admin/profile-image?v=${s.draft_profile_image_version}`:undefined},theme:s.draft_theme,publishedAt:s.published_at,updatedAt:s.updated_at};});
+app.get('/api/admin/profile-image',{preHandler:requireAdmin},async(_req,reply)=>{const s=await state();if(!s.draft_profile_image_path)return reply.code(404).send({error:'No draft profile image'});return reply.type('image/webp').header('Cross-Origin-Resource-Policy','cross-origin').header('Cache-Control','private,no-cache').send(createReadStream(join(uploadDir,s.draft_profile_image_path)));});
+app.put('/api/admin/cv',{preHandler:requireAdmin},async(req,reply)=>{const parsed=cvSchema.safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:'Some CV fields are invalid',issues:parsed.error.flatten()});await pool.query('UPDATE cv_state SET draft=$1,updated_at=now() WHERE id=1',[parsed.data]);await audit(req,'cv.saved');return{cv:parsed.data};});
+app.post('/api/admin/sections',{preHandler:requireAdmin},async(req,reply)=>{const parsed=sectionSchema.safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:'Invalid section',issues:parsed.error.flatten()});const s=await state();if(s.draft.sections.some(x=>x.id===parsed.data.id))return reply.code(409).send({error:'Section id already exists'});s.draft.sections.push(parsed.data);await pool.query('UPDATE cv_state SET draft=$1,updated_at=now() WHERE id=1',[s.draft]);await audit(req,'section.created',{id:parsed.data.id});return reply.code(201).send(parsed.data);});
+app.put('/api/admin/sections/:id',{preHandler:requireAdmin},async(req,reply)=>{const id=(req.params as {id:string}).id;const parsed=sectionSchema.safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:'Invalid section'});const s=await state(),index=s.draft.sections.findIndex(x=>x.id===id);if(index<0)return reply.code(404).send({error:'Section not found'});s.draft.sections[index]={...parsed.data,id};await pool.query('UPDATE cv_state SET draft=$1,updated_at=now() WHERE id=1',[s.draft]);await audit(req,'section.updated',{id});return s.draft.sections[index];});
+app.delete('/api/admin/sections/:id',{preHandler:requireAdmin},async(req,reply)=>{const id=(req.params as {id:string}).id,s=await state();const before=s.draft.sections.length;s.draft.sections=s.draft.sections.filter(x=>x.id!==id);if(before===s.draft.sections.length)return reply.code(404).send({error:'Section not found'});await pool.query('UPDATE cv_state SET draft=$1,updated_at=now() WHERE id=1',[s.draft]);await audit(req,'section.deleted',{id});return reply.code(204).send();});
+app.post('/api/admin/sections/reorder',{preHandler:requireAdmin},async(req,reply)=>{const parsed=z.object({ids:z.array(z.string()).min(1)}).safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:'Invalid section order'});const s=await state();if(new Set(parsed.data.ids).size!==s.draft.sections.length||!s.draft.sections.every(x=>parsed.data.ids.includes(x.id)))return reply.code(400).send({error:'Order must include every section exactly once'});s.draft.sections.sort((a,b)=>parsed.data.ids.indexOf(a.id)-parsed.data.ids.indexOf(b.id)).forEach((x,i)=>x.order=i);await pool.query('UPDATE cv_state SET draft=$1,updated_at=now() WHERE id=1',[s.draft]);await audit(req,'sections.reordered');return{sections:s.draft.sections};});
+
+app.put('/api/admin/theme',{preHandler:requireAdmin},async(req,reply)=>{const parsed=themeSchema.safeParse(req.body);if(!parsed.success)return reply.code(400).send({error:'Invalid theme',issues:parsed.error.flatten()});await pool.query('UPDATE cv_state SET draft_theme=$1,updated_at=now() WHERE id=1',[parsed.data]);await audit(req,'theme.saved');return{theme:parsed.data};});
+app.post('/api/admin/theme/reset',{preHandler:requireAdmin},async(req)=>{await pool.query('UPDATE cv_state SET draft_theme=$1,updated_at=now() WHERE id=1',[defaultTheme]);await audit(req,'theme.reset');return{theme:defaultTheme};});
+app.post('/api/admin/theme/generate',{preHandler:requireAdmin},async(req,reply)=>{const s=await state();if(!s.draft_profile_image_path)return reply.code(400).send({error:'Upload a profile image first'});const theme=await themeFromImage(join(uploadDir,s.draft_profile_image_path));await pool.query('UPDATE cv_state SET draft_theme=$1,updated_at=now() WHERE id=1',[theme]);await audit(req,'theme.generated');return{theme};});
+app.post('/api/admin/profile-image',{preHandler:requireAdmin},async(req,reply)=>{const file=await req.file();if(!file)return reply.code(400).send({error:'Choose an image'});if(!['image/jpeg','image/png','image/webp'].includes(file.mimetype))return reply.code(415).send({error:'Use a JPEG, PNG, or WebP image'});const input=await file.toBuffer(),name=`profile-${randomUUID()}.webp`,temp=join(uploadDir,`${name}.tmp`),final=join(uploadDir,name);try{await sharp(input,{failOn:'error',limitInputPixels:40_000_000}).rotate().resize(1200,1500,{fit:'cover',position:'attention'}).webp({quality:88}).toFile(temp);await rename(temp,final);}catch{await unlink(temp).catch(()=>{});return reply.code(400).send({error:'The image could not be processed'});}const previous=await state();await pool.query('UPDATE cv_state SET draft_profile_image_path=$1,draft_profile_image_version=draft_profile_image_version+1,updated_at=now() WHERE id=1',[name]);if(previous.draft_profile_image_path&&previous.draft_profile_image_path!==previous.published_profile_image_path)await unlink(join(uploadDir,previous.draft_profile_image_path)).catch(()=>{});const theme=await themeFromImage(final);await pool.query('UPDATE cv_state SET draft_theme=$1 WHERE id=1',[theme]);await audit(req,'profile-image.updated');return{imageUrl:`/api/admin/profile-image?v=${Date.now()}`,theme};});
+app.post('/api/admin/publish',{preHandler:requireAdmin},async(req)=>{const before=await state();await pool.query('UPDATE cv_state SET published=draft,published_theme=draft_theme,published_profile_image_path=draft_profile_image_path,published_profile_image_version=draft_profile_image_version,published_at=now(),updated_at=now() WHERE id=1');if(before.published_profile_image_path&&before.published_profile_image_path!==before.draft_profile_image_path)await unlink(join(uploadDir,before.published_profile_image_path)).catch(()=>{});await audit(req,'cv.published');return{ok:true,publishedAt:new Date().toISOString()};});
+app.get('/api/admin/pdf-preview',{preHandler:requireAdmin},async(_req,reply)=>{const s=await state();const bytes=await renderPdf(s.draft,s.draft_theme,env.publicOrigin);return reply.type('application/pdf').header('Content-Disposition','inline; filename="cv-preview.pdf"').send(bytes);});
+
+app.setErrorHandler((error,_req,reply)=>{app.log.error(error);if((error as {code?:string}).code==='FST_REQ_FILE_TOO_LARGE')return reply.code(413).send({error:`Image must be smaller than ${env.maxMb} MB`});return reply.code(500).send({error:'Something went wrong. Please try again.'});});
+await bootstrap(); await app.listen({host:'0.0.0.0',port:env.port});
+process.on('SIGTERM',async()=>{await app.close();await pool.end();});
